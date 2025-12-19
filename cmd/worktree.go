@@ -6,9 +6,29 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
+
+type DependencyConfig struct {
+	Dir       string
+	LockFiles []string
+	Install   string
+}
+
+var dependencies = []DependencyConfig{
+	{
+		Dir:       "node_modules",
+		LockFiles: []string{"package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml"},
+		Install:   "npm ci",
+	},
+	{
+		Dir:       "vendor",
+		LockFiles: []string{"composer.json", "composer.lock"},
+		Install:   "composer install",
+	},
+}
 
 var worktreeCmd = &cobra.Command{
 	Use:   "worktree [name] [branch]",
@@ -50,6 +70,7 @@ var worktreeCmd = &cobra.Command{
 		baseDir, _ := cmd.Flags().GetString("dir")
 		newBranch, _ := cmd.Flags().GetBool("new-branch")
 		originBranch, _ := cmd.Flags().GetString("origin")
+		symlinkDeps, _ := cmd.Flags().GetBool("symlink-deps")
 
 		worktreePath := filepath.Join(baseDir, name)
 
@@ -64,7 +85,6 @@ var worktreeCmd = &cobra.Command{
 			gitArgs = append(gitArgs, worktreePath, branch)
 		}
 
-		fmt.Printf("Creating worktree at %s...\n", worktreePath)
 		gitCmd := exec.Command("git", gitArgs...)
 		gitCmd.Stdout = os.Stdout
 		gitCmd.Stderr = os.Stderr
@@ -73,7 +93,20 @@ var worktreeCmd = &cobra.Command{
 			return fmt.Errorf("failed to create worktree: %w", err)
 		}
 
-		fmt.Println("Opening terminal with Claude...")
+		if symlinkDeps {
+			sourceRepo, err := getRepoRoot()
+			if err != nil {
+				return err
+			}
+			if err := symlinkDependencies(sourceRepo, worktreePath); err != nil {
+				return err
+			}
+		} else {
+			if err := installFreshDependencies(worktreePath); err != nil {
+				return err
+			}
+		}
+
 		return openTerminalWithClaude(worktreePath)
 	},
 }
@@ -100,49 +133,96 @@ func validateBranchExists(branch string) error {
 	return fmt.Errorf("branch '%s' not found locally or in origin", branch)
 }
 
+func getRepoRoot() (string, error) {
+	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(strings.TrimSpace(string(out))), nil
+}
+
 func openTerminalWithClaude(dir string) error {
 	absPath, err := filepath.Abs(dir)
 	if err != nil {
 		return err
 	}
 
-	switch runtime.GOOS {
-	case "windows":
+	if runtime.GOOS == "windows" {
 		return exec.Command("wt", "-d", absPath, "cmd", "/k", "claude").Start()
-
-	case "darwin":
-		script := fmt.Sprintf(`
-			tell application "Terminal"
-				do script "cd '%s' && claude"
-				activate
-			end tell`, absPath)
-		return exec.Command("osascript", "-e", script).Start()
-
-	case "linux":
-		terminals := []struct {
-			name string
-			args []string
-		}{
-			{"gnome-terminal", []string{"--working-directory", absPath, "--", "claude"}},
-			{"konsole", []string{"--workdir", absPath, "-e", "claude"}},
-			{"xfce4-terminal", []string{"--working-directory", absPath, "-e", "claude"}},
-			{"xterm", []string{"-e", fmt.Sprintf("cd '%s' && claude", absPath)}},
-		}
-
-		for _, t := range terminals {
-			if _, err := exec.LookPath(t.name); err == nil {
-				return exec.Command(t.name, t.args...).Start()
-			}
-		}
-		return fmt.Errorf("no supported terminal found")
 	}
 
-	return fmt.Errorf("unsupported OS: %s", runtime.GOOS)
+	script := fmt.Sprintf(`tell application "Terminal"
+		do script "cd '%s' && claude"
+		activate
+	end tell`, absPath)
+	return exec.Command("osascript", "-e", script).Start()
+}
+
+func installFreshDependencies(worktreePath string) error {
+	for _, dep := range dependencies {
+		hasLockFile := false
+		for _, lockFile := range dep.LockFiles {
+			if _, err := os.Stat(filepath.Join(worktreePath, lockFile)); err == nil {
+				hasLockFile = true
+				break
+			}
+		}
+
+		if !hasLockFile {
+			continue
+		}
+
+		var cmd *exec.Cmd
+		if runtime.GOOS == "windows" {
+			cmd = exec.Command("cmd", "/c", dep.Install)
+		} else {
+			cmd = exec.Command("sh", "-c", dep.Install)
+		}
+
+		cmd.Dir = worktreePath
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to run %s: %w", dep.Install, err)
+		}
+	}
+
+	return nil
+}
+
+func symlinkDependencies(sourceRepo, worktreePath string) error {
+	for _, dep := range dependencies {
+		sourceDep := filepath.Join(sourceRepo, dep.Dir)
+		targetDep := filepath.Join(worktreePath, dep.Dir)
+
+		if _, err := os.Stat(sourceDep); os.IsNotExist(err) {
+			continue
+		}
+
+		if err := createSymlink(sourceDep, targetDep); err != nil {
+			return fmt.Errorf("failed to symlink %s: %w", dep.Dir, err)
+		}
+	}
+
+	return nil
+}
+
+func createSymlink(source, target string) error {
+	os.RemoveAll(target)
+
+	if runtime.GOOS == "windows" {
+		return exec.Command("cmd", "/c", "mklink", "/J", target, source).Run()
+	}
+
+	return os.Symlink(source, target)
 }
 
 func init() {
 	worktreeCmd.Flags().StringP("dir", "d", "../", "Base directory for worktrees")
 	worktreeCmd.Flags().BoolP("new-branch", "b", false, "Create a new branch")
 	worktreeCmd.Flags().StringP("origin", "o", "", "Origin branch (for new branches)")
+	worktreeCmd.Flags().BoolP("symlink-deps", "s", true, "Symlink dependencies instead of fresh install")
 	rootCmd.AddCommand(worktreeCmd)
 }
